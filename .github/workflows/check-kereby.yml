@@ -1,0 +1,46 @@
+name: Overvåg Kereby boliger
+
+on:
+  schedule:
+    # Kører hvert 20. minut.
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}   # gør det muligt at trigge manuelt fra Actions-fanen
+
+permissions:
+  contents: write   # nødvendigt for at scriptet kan gemme opdateret status
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright browsere
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Installer afhængigheder
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Kør tjek af Kereby
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python check_kereby.py
+
+      - name: Gem opdateret status i repoet
+        run: |
+          git config user.name "kereby-overvaagning"
+          git config user.email "actions@github.com"
+          git add seen_listings.json
+          git diff --cached --quiet || git commit -m "Opdater liste over sete boliger"
+          git push
