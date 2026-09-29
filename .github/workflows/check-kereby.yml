@@ -2,10 +2,12 @@ name: Overvåg Kereby boliger
 
 on:
   schedule:
-    # Kører hvert 10. minut, hele døgnet i UTC. Selve begrænsningen til
-    # 08-17 dansk tid sker i "Tjek tidsvindue"-trinnet nedenfor, så det er
-    # korrekt både ved sommertid og vintertid.
-    - cron: "*/10 * * * *"
+    # Kører hvert 10. minut, men KUN mellem kl. 08 og 17 (Europe/Copenhagen).
+    # GitHub regner selv om til UTC og håndterer sommer-/vintertid
+    # automatisk via "timezone"-feltet, så der er ingen unødvendige
+    # kørsler uden for tidsvinduet.
+    - cron: "*/10 8-16 * * *"
+      timezone: "Europe/Copenhagen"
   workflow_dispatch: {}   # gør det muligt at trigge manuelt fra Actions-fanen
 
 permissions:
@@ -17,37 +19,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tjek tidsvindue (08-17 dansk tid)
-        id: tidscheck
-        run: |
-          RESULT=$(python3 -c "
-          import datetime, zoneinfo
-          now = datetime.datetime.now(zoneinfo.ZoneInfo('Europe/Copenhagen'))
-          print('true' if 8 <= now.hour < 17 else 'false')
-          ")
-          echo "Dansk lokaltid nu: $(TZ=Europe/Copenhagen date)"
-          echo "inden_for_vindue=$RESULT" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-python@v5
-        if: steps.tidscheck.outputs.inden_for_vindue == 'true'
         with:
           python-version: "3.11"
 
       - name: Cache Playwright browsere
-        if: steps.tidscheck.outputs.inden_for_vindue == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
 
       - name: Installer afhængigheder
-        if: steps.tidscheck.outputs.inden_for_vindue == 'true'
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
       - name: Kør tjek af Kereby
-        if: steps.tidscheck.outputs.inden_for_vindue == 'true'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -55,7 +42,6 @@ jobs:
         run: python check_kereby.py
 
       - name: Gem opdateret status i repoet
-        if: steps.tidscheck.outputs.inden_for_vindue == 'true'
         run: |
           git config user.name "kereby-overvaagning"
           git config user.email "actions@github.com"
