@@ -5,6 +5,9 @@ ny bolig op på listen (ikke ved statusskift på eksisterende boliger).
 Første kørsel gemmer blot en "baseline" over de boliger der findes lige nu
 og sender ingen mail. Alle efterfølgende kørsler sammenligner med sidste
 kendte tilstand og mailer kun om reelt nye annoncer.
+
+Hvis siden ikke kan indlæses korrekt, afslutter scriptet med en fejl, så
+kørslen bliver rød i GitHub Actions i stedet for at se grøn og "OK" ud.
 """
 
 import asyncio
@@ -12,6 +15,7 @@ import json
 import os
 import re
 import smtplib
+import sys
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -24,21 +28,31 @@ STATE_FILE = Path("seen_listings.json")
 # forsiden https://kereby.dk/bolig/
 LISTING_HREF_RE = re.compile(r"^https://kereby\.dk/bolig/[^/?#]+/?$")
 
+# Siden skriver fx "15 boliger fundet" når listen er indlæst korrekt.
+PAGE_LOADED_RE = re.compile(r"(\d+)\s+bolig(?:er)?\s+fundet", re.IGNORECASE)
 
-async def fetch_listings() -> dict[str, str]:
-    """Henter siden med en rigtig browser og returnerer {url: kort beskrivelse}."""
+
+async def fetch_page() -> tuple[dict[str, str], str | None]:
+    """
+    Henter siden med en rigtig browser.
+    Returnerer ({url: kort beskrivelse}, tekst-om-antal-boliger eller None).
+    Det andet felt er None, hvis siden ikke ser ud til at være indlæst korrekt.
+    """
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.goto(URL, wait_until="networkidle", timeout=60000)
-        # Giv eventuelt JS-drevet indhold lidt ekstra tid til at rendere
-        await page.wait_for_timeout(3000)
+        try:
+            page = await browser.new_page()
+            await page.goto(URL, wait_until="networkidle", timeout=60000)
+            # Giv JS-drevet indhold lidt ekstra tid til at rendere
+            await page.wait_for_timeout(3000)
 
-        anchors = await page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(el => ({href: el.href, text: el.innerText.trim()}))",
-        )
-        await browser.close()
+            anchors = await page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(el => ({href: el.href, text: el.innerText.trim()}))",
+            )
+            body_text = await page.inner_text("body")
+        finally:
+            await browser.close()
 
     listings: dict[str, str] = {}
     for a in anchors:
@@ -46,7 +60,9 @@ async def fetch_listings() -> dict[str, str]:
         if LISTING_HREF_RE.match(href) and href != URL:
             text = (a["text"] or href).replace("\n", " ").strip()
             listings[href] = text[:300]
-    return listings
+
+    match = PAGE_LOADED_RE.search(body_text)
+    return listings, (match.group(0) if match else None)
 
 
 def load_state() -> dict[str, str] | None:
@@ -78,13 +94,34 @@ def send_email(subject: str, body: str) -> None:
 
 
 async def main() -> None:
-    current = await fetch_listings()
+    current: dict[str, str] = {}
+    page_text: str | None = None
+
+    # Prøv op til to gange, så et enkelt hængende sidebesøg ikke vælter kørslen
+    for attempt in (1, 2):
+        try:
+            current, page_text = await fetch_page()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Forsøg {attempt} fejlede: {exc}")
+            page_text = None
+        if page_text is not None:
+            break
+        if attempt == 1:
+            await asyncio.sleep(10)
+
+    if page_text is None:
+        print(
+            "FEJL: Siden blev ikke indlæst korrekt (teksten om antal boliger "
+            "mangler). Kereby kan have ændret siden eller blokere besøget."
+        )
+        sys.exit(1)
+
+    print(f"Siden indlæst: '{page_text}'. Boliger med link fundet: {len(current)}.")
 
     if not current:
-        print(
-            "Fandt ingen boliglinks på siden. Kereby kan have ændret "
-            "struktur på hjemmesiden — scriptet bør tjekkes/opdateres."
-        )
+        # Reserverede og udlejede boliger har intet link på siden, så det kan
+        # i sig selv være normalt. Vi rører ikke ved den gemte status.
+        print("Ingen boliger med link lige nu. Ingen ændringer.")
         return
 
     previous = load_state()
