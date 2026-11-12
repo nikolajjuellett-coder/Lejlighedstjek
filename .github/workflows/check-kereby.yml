@@ -2,39 +2,67 @@ name: Overvåg Kereby boliger
 
 on:
   schedule:
-    # Kører hvert 10. minut, men KUN mellem kl. 08 og 17 (Europe/Copenhagen).
-    # GitHub regner selv om til UTC og håndterer sommer-/vintertid
-    # automatisk via "timezone"-feltet, så der er ingen unødvendige
-    # kørsler uden for tidsvinduet.
-    - cron: "*/10 8-16 * * *"
+    # Hvert 5. minut mellem kl. 08 og 17 (Europe/Copenhagen).
+    # GitHub dropper og forsinker mange skemalagte kørsler, så der planlægges
+    # tættere end nødvendigt (5 min er GitHubs minimum) for at kompensere.
+    # Minutterne er forskudt (3, 8, 13 ...), fordi GitHub er mest belastet
+    # ved hele og halve timer, hvor kørsler oftest bliver droppet.
+    - cron: "3-58/5 8-16 * * *"
       timezone: "Europe/Copenhagen"
-  workflow_dispatch: {}   # gør det muligt at trigge manuelt fra Actions-fanen
+  workflow_dispatch: {}   # manuel start fra Actions-fanen kører altid
 
 permissions:
   contents: write   # nødvendigt for at scriptet kan gemme opdateret status
 
+# Undgå at to kørsler overlapper og overskriver hinandens status
+concurrency:
+  group: kereby-overvagning
+  cancel-in-progress: false
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04      # fastlåst; "ubuntu-latest" skifter til Ubuntu 26
+    timeout-minutes: 8         # en hængende kørsel stoppes efter 8 min
     steps:
       - uses: actions/checkout@v4
 
+      # Ekstra sikkerhed: tjek dansk lokaltid, uanset hvordan skemaet tolkes.
+      # Manuelle starter springer tjekket over.
+      - name: Tjek tidsvindue (08-17 dansk tid)
+        id: tidscheck
+        run: |
+          HOUR=$(TZ=Europe/Copenhagen date +%H)
+          echo "Dansk lokaltid nu: $(TZ=Europe/Copenhagen date)"
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$((10#$HOUR))" -lt 8 ] || [ "$((10#$HOUR))" -ge 17 ]; }; then
+            echo "Uden for 08-17 - springer tjek over."
+            echo "run_check=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_check=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.tidscheck.outputs.run_check == 'true'
         with:
           python-version: "3.11"
 
       - name: Cache Playwright browsere
+        if: steps.tidscheck.outputs.run_check == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
 
       - name: Installer afhængigheder
+        if: steps.tidscheck.outputs.run_check == 'true'
         run: |
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          playwright install chromium
+          # Systembiblioteker er normalt allerede installeret. Hvis Ubuntus
+          # servere ikke kan nås, må det ikke vælte hele kørslen.
+          timeout 120 playwright install-deps chromium || echo "install-deps fejlede - fortsætter alligevel"
 
       - name: Kør tjek af Kereby
+        if: steps.tidscheck.outputs.run_check == 'true'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -42,6 +70,7 @@ jobs:
         run: python check_kereby.py
 
       - name: Gem opdateret status i repoet
+        if: steps.tidscheck.outputs.run_check == 'true'
         run: |
           git config user.name "kereby-overvaagning"
           git config user.email "actions@github.com"
