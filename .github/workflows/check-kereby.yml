@@ -1,20 +1,25 @@
 name: Overvåg Kereby boliger
 
+# Hvorfor en "kæde" af kørsler i stedet for et skema?
+# GitHubs skemalagte kørsler er "best effort" og blev i praksis kun startet
+# 1-2 gange i døgnet i stedet for hvert 5. minut. Derfor kører hver kørsel her
+# selv en løkke i op til 5 timer (tjek hvert 5. minut mellem 08 og 17 dansk
+# tid) og starter bagefter selv den næste kørsel. Skemaet nedenfor er kun et
+# sikkerhedsnet, der genstarter kæden, hvis den skulle gå i stå.
+#
+# KRÆVER et offentligt (public) repo: kørslen er i gang hele døgnet, og et
+# privat repo ville bruge sin gratis kvote på få dage.
+
 on:
   schedule:
-    # Hvert 5. minut mellem kl. 08 og 17 (Europe/Copenhagen).
-    # GitHub dropper og forsinker mange skemalagte kørsler, så der planlægges
-    # tættere end nødvendigt (5 min er GitHubs minimum) for at kompensere.
-    # Minutterne er forskudt (3, 8, 13 ...), fordi GitHub er mest belastet
-    # ved hele og halve timer, hvor kørsler oftest bliver droppet.
-    - cron: "3-58/5 8-16 * * *"
-      timezone: "Europe/Copenhagen"
-  workflow_dispatch: {}   # manuel start fra Actions-fanen kører altid
+    - cron: "7 * * * *"   # sikkerhedsnet, hver time (UTC)
+  workflow_dispatch: {}   # manuel start: "Run workflow" i Actions-fanen
 
 permissions:
-  contents: write   # nødvendigt for at scriptet kan gemme opdateret status
+  contents: write   # gem opdateret status i repoet
+  actions: write    # start næste kørsel
 
-# Undgå at to kørsler overlapper og overskriver hinandens status
+# Kun én kørsel ad gangen. Ekstra kørsler venter i kø (højst én).
 concurrency:
   group: kereby-overvagning
   cancel-in-progress: false
@@ -22,38 +27,21 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04      # fastlåst; "ubuntu-latest" skifter til Ubuntu 26
-    timeout-minutes: 8         # en hængende kørsel stoppes efter 8 min
+    timeout-minutes: 340       # løkken stopper selv efter 300 min
     steps:
       - uses: actions/checkout@v4
 
-      # Ekstra sikkerhed: tjek dansk lokaltid, uanset hvordan skemaet tolkes.
-      # Manuelle starter springer tjekket over.
-      - name: Tjek tidsvindue (08-17 dansk tid)
-        id: tidscheck
-        run: |
-          HOUR=$(TZ=Europe/Copenhagen date +%H)
-          echo "Dansk lokaltid nu: $(TZ=Europe/Copenhagen date)"
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$((10#$HOUR))" -lt 8 ] || [ "$((10#$HOUR))" -ge 17 ]; }; then
-            echo "Uden for 08-17 - springer tjek over."
-            echo "run_check=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_check=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/setup-python@v5
-        if: steps.tidscheck.outputs.run_check == 'true'
         with:
           python-version: "3.11"
 
       - name: Cache Playwright browsere
-        if: steps.tidscheck.outputs.run_check == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
 
       - name: Installer afhængigheder
-        if: steps.tidscheck.outputs.run_check == 'true'
         run: |
           pip install -r requirements.txt
           playwright install chromium
@@ -61,19 +49,27 @@ jobs:
           # servere ikke kan nås, må det ikke vælte hele kørslen.
           timeout 120 playwright install-deps chromium || echo "install-deps fejlede - fortsætter alligevel"
 
-      - name: Kør tjek af Kereby
-        if: steps.tidscheck.outputs.run_check == 'true'
+      - name: Overvåg Kereby (løbende)
+        id: loop
         env:
+          PYTHONUNBUFFERED: "1"
+          MAX_RUN_MIN: "300"
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python check_kereby.py
 
       - name: Gem opdateret status i repoet
-        if: steps.tidscheck.outputs.run_check == 'true'
+        if: always()
         run: |
           git config user.name "kereby-overvaagning"
           git config user.email "actions@github.com"
           git add seen_listings.json
           git diff --cached --quiet || git commit -m "Opdater liste over sete boliger"
-          git push
+          git push || echo "push fejlede - status gemmes ved næste ændring"
+
+      - name: Start næste kørsel
+        if: always() && steps.loop.outputs.genstart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run check-kereby.yml --ref "${{ github.ref_name }}"
